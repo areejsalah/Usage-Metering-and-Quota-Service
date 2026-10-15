@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "idx_users_account_external_id" ON "users" USING btree ("account_id","external_id");
