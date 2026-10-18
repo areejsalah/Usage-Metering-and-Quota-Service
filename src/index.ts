@@ -1,19 +1,51 @@
+
 import { randomBytes, createHash } from "node:crypto";
 import express from "express";
-import { and, desc, eq, lte, or, sql } from "drizzle-orm";
+import { and, desc, eq, lte, or } from "drizzle-orm";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
+
 import { db } from "./db/index.js";
+import { authenticateApiKey } from "./auth.js";
+
 import {
   accounts,
-  plans,
-  users,
-  accountPlanAssignments,
-  userPlanAssignments,
   accountMonthlyUsage,
   userMonthlyUsage,
-  usageRequests,
 } from "./db/schema.js";
-import { authenticateApiKey } from "./auth.js";
+
+import {
+  createAccount,
+} from "./db/queries/accounts.js";
+
+import {
+  createUser,
+  getUserByExternalId,
+} from "./db/queries/users.js";
+
+import {
+  createPlan,
+  getAvailablePlans,
+  getPlanById,
+} from "./db/queries/plans.js";
+
+import {
+  createAccountPlanAssignment,
+  createUserPlanAssignment,
+  getCurrentAccountPlanAssignment,
+  getCurrentUserPlanAssignment,
+} from "./db/queries/assignments.js";
+
+import {
+  getAccountMonthlyUsage,
+  getUserMonthlyUsage,
+  incrementAccountMonthlyUsage,
+  incrementUserMonthlyUsage,
+} from "./db/queries/usage.js";
+
+import {
+  createUsageRequest,
+  getUsageRequestByRequestId,
+} from "./db/queries/usageRequests.js";
 
 const app = express();
 const PORT = 3000;
@@ -44,17 +76,10 @@ app.post("/accounts", async (req, res, next) => {
       .update(apiKey)
       .digest("hex");
 
-    const [account] = await db
-      .insert(accounts)
-      .values({
-        name: name.trim(),
-        apiKeyHash,
-      })
-      .returning({
-        id: accounts.id,
-        name: accounts.name,
-        createdAt: accounts.createdAt,
-      });
+    const account = await createAccount(
+      name.trim(),
+      apiKeyHash,
+    );
 
     res.status(201).json({
       account,
@@ -82,16 +107,11 @@ app.post("/users", authenticateApiKey, async (req, res, next) => {
 
     const normalizedExternalId = externalId.trim();
 
-    const [existingUser] = await db
-      .select({ id: users.id })
-      .from(users)
-      .where(
-        and(
-          eq(users.accountId, account.id),
-          eq(users.externalId, normalizedExternalId),
-        ),
-      )
-      .limit(1);
+    const existingUser = await getUserByExternalId(
+      db,
+      account.id,
+      normalizedExternalId,
+    );
 
     if (existingUser) {
       res.status(409).json({
@@ -100,18 +120,10 @@ app.post("/users", authenticateApiKey, async (req, res, next) => {
       return;
     }
 
-    const [user] = await db
-      .insert(users)
-      .values({
-        accountId: account.id,
-        externalId: normalizedExternalId,
-      })
-      .returning({
-        id: users.id,
-        accountId: users.accountId,
-        externalId: users.externalId,
-        createdAt: users.createdAt,
-      });
+    const user = await createUser(
+      account.id,
+      normalizedExternalId,
+    );
 
     res.status(201).json({ user });
   } catch (error) {
@@ -119,14 +131,20 @@ app.post("/users", authenticateApiKey, async (req, res, next) => {
   }
 });
 
-// Create a custom plan owned by the authenticated account.
 app.post("/plans", authenticateApiKey, async (req, res, next) => {
   try {
     const account = res.locals.account as { id: string };
-    const { name, type, monthlyAllowance, maxUnitsPerRequest } = req.body;
+    const {
+      name,
+      type,
+      monthlyAllowance,
+      maxUnitsPerRequest,
+    } = req.body;
 
     if (typeof name !== "string" || name.trim().length === 0) {
-      res.status(400).json({ error: "A non-empty name is required" });
+      res.status(400).json({
+        error: "A non-empty name is required",
+      });
       return;
     }
 
@@ -157,17 +175,13 @@ app.post("/plans", authenticateApiKey, async (req, res, next) => {
       return;
     }
 
-    const [plan] = await db
-      .insert(plans)
-      .values({
-        name: name.trim(),
-        type,
-        monthlyAllowance,
-        maxUnitsPerRequest,
-        isPredefined: false,
-        accountId: account.id,
-      })
-      .returning();
+    const plan = await createPlan(
+      name.trim(),
+      type,
+      monthlyAllowance,
+      maxUnitsPerRequest,
+      account.id,
+    );
 
     res.status(201).json({ plan });
   } catch (error) {
@@ -175,72 +189,63 @@ app.post("/plans", authenticateApiKey, async (req, res, next) => {
   }
 });
 
-// List predefined plans and custom plans available to this account.
 app.get("/plans", authenticateApiKey, async (req, res, next) => {
   try {
     const account = res.locals.account as { id: string };
 
-    const availablePlans = await db
-      .select()
-      .from(plans)
-      .where(
-        or(
-          eq(plans.isPredefined, true),
-          eq(plans.accountId, account.id),
-        ),
-      )
-      .orderBy(plans.type, plans.name);
+    const availablePlans = await getAvailablePlans(account.id);
 
-    res.status(200).json({ plans: availablePlans });
+    res.status(200).json({
+      plans: availablePlans,
+    });
   } catch (error) {
     next(error);
   }
 });
 
-// Assign an account-level plan.
-app.post("/account/plan", authenticateApiKey, async (req, res, next) => {
-  try {
-    const account = res.locals.account as { id: string };
-    const { planId } = req.body;
+app.post(
+  "/account/plan",
+  authenticateApiKey,
+  async (req, res, next) => {
+    try {
+      const account = res.locals.account as { id: string };
+      const { planId } = req.body;
 
-    if (typeof planId !== "string") {
-      res.status(400).json({ error: "planId is required" });
-      return;
-    }
+      if (typeof planId !== "string") {
+        res.status(400).json({
+          error: "planId is required",
+        });
+        return;
+      }
 
-    const [plan] = await db
-      .select()
-      .from(plans)
-      .where(eq(plans.id, planId))
-      .limit(1);
+      const plan = await getPlanById(db, planId);
 
-    if (
-      !plan ||
-      plan.type !== "account" ||
-      (!plan.isPredefined && plan.accountId !== account.id)
-    ) {
-      res.status(400).json({
-        error: "Invalid account plan or plan is not accessible",
+      if (
+        !plan ||
+        plan.type !== "account" ||
+        (!plan.isPredefined && plan.accountId !== account.id)
+      ) {
+        res.status(400).json({
+          error: "Invalid account plan or plan is not accessible",
+        });
+        return;
+      }
+
+      const assignment = await createAccountPlanAssignment(
+        account.id,
+        plan.id,
+     );
+
+      res.status(201).json({
+        assignment,
+        plan,
       });
-      return;
+    } catch (error) {
+      next(error);
     }
+  },
+);
 
-    const [assignment] = await db
-      .insert(accountPlanAssignments)
-      .values({
-        accountId: account.id,
-        planId: plan.id,
-        effectiveFrom: new Date(),
-      })
-      .returning();
-
-    res.status(201).json({ assignment, plan });
-  } catch (error) {
-    next(error);
-  }
-});
-
-// Assign a user-level plan to a user belonging to this account.
 app.post(
   "/users/:externalId/plan",
   authenticateApiKey,
@@ -251,26 +256,24 @@ app.post(
       const { planId } = req.body;
 
       if (typeof externalId !== "string") {
-         res.status(400).json({
-         error: "Invalid externalId",
-      });
-      return;
-      }
-      if (typeof planId !== "string") {
-        res.status(400).json({ error: "planId is required" });
+        res.status(400).json({
+          error: "Invalid externalId",
+        });
         return;
       }
 
-      const [user] = await db
-        .select()
-        .from(users)
-        .where(
-          and(
-            eq(users.accountId, account.id),
-            eq(users.externalId, externalId),
-          ),
-        )
-        .limit(1);
+      if (typeof planId !== "string") {
+        res.status(400).json({
+          error: "planId is required",
+        });
+        return;
+      }
+
+      const user = await getUserByExternalId(
+        db,
+        account.id,
+        externalId,
+      );
 
       if (!user) {
         res.status(404).json({
@@ -279,11 +282,7 @@ app.post(
         return;
       }
 
-      const [plan] = await db
-        .select()
-        .from(plans)
-        .where(eq(plans.id, planId))
-        .limit(1);
+      const plan = await getPlanById(db,planId);
 
       if (
         !plan ||
@@ -296,60 +295,55 @@ app.post(
         return;
       }
 
-      const [assignment] = await db
-        .insert(userPlanAssignments)
-        .values({
-          userId: user.id,
-          planId: plan.id,
-          effectiveFrom: new Date(),
-        })
-        .returning();
+      const assignment = await createUserPlanAssignment(
+        user.id,
+        plan.id,
+  
+      );
 
-      res.status(201).json({ assignment, plan });
+      res.status(201).json({
+        assignment,
+        plan,
+      });
     } catch (error) {
       next(error);
     }
   },
 );
 
-// Inspect the currently applied account plan.
-app.get("/account/plan", authenticateApiKey, async (req, res, next) => {
-  try {
-    const account = res.locals.account as { id: string };
-    const now = new Date();
+app.get(
+  "/account/plan",
+  authenticateApiKey,
+  async (req, res, next) => {
+    try {
+      const account = res.locals.account as { id: string };
+      const now = new Date();
 
-    const [assignment] = await db
-      .select()
-      .from(accountPlanAssignments)
-      .where(
-        and(
-          eq(accountPlanAssignments.accountId, account.id),
-          lte(accountPlanAssignments.effectiveFrom, now),
-        ),
-      )
-      .orderBy(desc(accountPlanAssignments.effectiveFrom))
-      .limit(1);
+      const assignment = await getCurrentAccountPlanAssignment(
+        db,
+        account.id,
+        now,
+      );
 
-    if (!assignment) {
-      res.status(404).json({
-        error: "No account plan is currently assigned",
+      if (!assignment) {
+        res.status(404).json({
+          error: "No account plan is currently assigned",
+        });
+        return;
+      }
+
+      const plan = await getPlanById(db,assignment.planId);
+
+      res.status(200).json({
+        assignment,
+        plan,
       });
-      return;
+    } catch (error) {
+      next(error);
     }
+  },
+);
 
-    const [plan] = await db
-      .select()
-      .from(plans)
-      .where(eq(plans.id, assignment.planId))
-      .limit(1);
-
-    res.status(200).json({ assignment, plan });
-  } catch (error) {
-    next(error);
-  }
-});
-
-// Inspect the currently applied plan for a user in this account.
 app.get(
   "/users/:externalId/plan",
   authenticateApiKey,
@@ -366,16 +360,11 @@ app.get(
         return;
       }
 
-      const [user] = await db
-        .select()
-        .from(users)
-        .where(
-          and(
-            eq(users.accountId, account.id),
-            eq(users.externalId, externalId),
-          ),
-        )
-        .limit(1);
+      const user = await getUserByExternalId(
+        db,
+        account.id,
+        externalId,
+      );
 
       if (!user) {
         res.status(404).json({
@@ -384,17 +373,11 @@ app.get(
         return;
       }
 
-      const [assignment] = await db
-        .select()
-        .from(userPlanAssignments)
-        .where(
-          and(
-            eq(userPlanAssignments.userId, user.id),
-            lte(userPlanAssignments.effectiveFrom, now),
-          ),
-        )
-        .orderBy(desc(userPlanAssignments.effectiveFrom))
-        .limit(1);
+      const assignment = await getCurrentUserPlanAssignment(
+        db,
+        user.id,
+        now,
+      );
 
       if (!assignment) {
         res.status(404).json({
@@ -403,358 +386,302 @@ app.get(
         return;
       }
 
-      const [plan] = await db
-        .select()
-        .from(plans)
-        .where(eq(plans.id, assignment.planId))
-        .limit(1);
+      const plan = await getPlanById(db,assignment.planId);
 
-      res.status(200).json({ assignment, plan });
+      res.status(200).json({
+        assignment,
+        plan,
+      });
     } catch (error) {
       next(error);
     }
   },
 );
 
+app.post(
+  "/usage/consume",
+  authenticateApiKey,
+  async (req, res, next) => {
+    try {
+      const account = res.locals.account as { id: string };
+      const { externalId, units, requestId } = req.body;
 
-app.post("/usage/consume", authenticateApiKey, async (req, res, next) => {
-  try {
-    const account = res.locals.account as { id: string };
-    const { externalId, units, requestId } = req.body;
-
-    // Validate request input.
-    if (
-      typeof externalId !== "string" ||
-      externalId.trim().length === 0
-    ) {
-      res.status(400).json({
-        error: "externalId is required",
-      });
-      return;
-    }
-
-    if (!Number.isSafeInteger(units) || units <= 0) {
-      res.status(400).json({
-        error: "units must be a positive safe integer",
-      });
-      return;
-    }
-
-    if (
-      typeof requestId !== "string" ||
-      requestId.trim().length === 0 ||
-      requestId.length > 255
-    ) {
-      res.status(400).json({
-        error: "requestId is required and must be at most 255 characters",
-      });
-      return;
-    }
-
-    const result = await db.transaction(async (tx) => {
-      // Lock the account to serialize consumption requests.
-      const [lockedAccount] = await tx
-        .select({ id: accounts.id })
-        .from(accounts)
-        .where(eq(accounts.id, account.id))
-        .for("update");
-
-      if (!lockedAccount) {
-        return {
-          status: 401,
-          body: { error: "Account not found" },
-        };
+      if (
+        typeof externalId !== "string" ||
+        externalId.trim().length === 0
+      ) {
+        res.status(400).json({ error: "externalId is required" });
+        return;
       }
 
-      // Find the user within the authenticated account.
-      const [user] = await tx
-        .select()
-        .from(users)
-        .where(
-          and(
-            eq(users.accountId, account.id),
-            eq(users.externalId, externalId.trim()),
-          ),
-        )
-        .limit(1);
-
-      if (!user) {
-        return {
-          status: 404,
-          body: { error: "User not found in this account" },
-        };
+      if (!Number.isSafeInteger(units) || units <= 0) {
+        res.status(400).json({
+          error: "units must be a positive safe integer",
+        });
+        return;
       }
 
-      // Check whether this request ID has already been processed.
-      const [existingRequest] = await tx
-        .select()
-        .from(usageRequests)
-        .where(
-          and(
-            eq(usageRequests.accountId, account.id),
-            eq(usageRequests.requestId, requestId.trim()),
-          ),
-        )
-        .limit(1);
+      if (
+        typeof requestId !== "string" ||
+        requestId.trim().length === 0 ||
+        requestId.length > 255
+      ) {
+        res.status(400).json({
+          error:
+            "requestId is required and must be at most 255 characters",
+        });
+        return;
+      }
 
-      if (existingRequest) {
-        if (
-          existingRequest.userId !== user.id ||
-          Number(existingRequest.units) !== units
-        ) {
+      const result = await db.transaction(async (tx) => {
+        // Lock the account to serialize consumption requests.
+        const [lockedAccount] = await tx
+          .select({ id: accounts.id })
+          .from(accounts)
+          .where(eq(accounts.id, account.id))
+          .for("update");
+
+        if (!lockedAccount) {
           return {
-            status: 409,
+            status: 401,
+            body: { error: "Account not found" },
+          };
+        }
+
+        // Find the user within the authenticated account.
+        const user = await getUserByExternalId(
+          tx,
+          account.id,
+          externalId.trim(),
+        );
+
+        if (!user) {
+          return {
+            status: 404,
+            body: { error: "User not found in this account" },
+          };
+        }
+
+        // Check whether this request ID has already been processed.
+        const existingRequest = await getUsageRequestByRequestId(
+          tx,
+          account.id,
+          requestId.trim(),
+        );
+
+        if (existingRequest) {
+          if (
+            existingRequest.userId !== user.id ||
+            Number(existingRequest.units) !== units
+          ) {
+            return {
+              status: 409,
+              body: {
+                error:
+                  "requestId was already used with different request data",
+              },
+            };
+          }
+
+          return {
+            status: existingRequest.status === "ACCEPTED" ? 200 : 429,
             body: {
-              error: "requestId was already used with different request data",
+              requestId: existingRequest.requestId,
+              status: existingRequest.status,
+              units: Number(existingRequest.units),
+              rejectionReason: existingRequest.rejectionReason,
+              rejectionScope: existingRequest.rejectionScope,
+              idempotent: true,
             },
           };
         }
 
-        return {
-          status: existingRequest.status === "ACCEPTED" ? 200 : 429,
-          body: {
-            requestId: existingRequest.requestId,
-            status: existingRequest.status,
-            units: Number(existingRequest.units),
-            rejectionReason: existingRequest.rejectionReason,
-            rejectionScope: existingRequest.rejectionScope,
-            idempotent: true,
-          },
-        };
-      }
+        const now = new Date();
+        const billingMonth = now.toISOString().slice(0, 7);
 
-      const now = new Date();
-      const billingMonth = now.toISOString().slice(0, 7);
+        // Find the current account plan.
+        const accountAssignment =
+          await getCurrentAccountPlanAssignment(tx,account.id, now);
 
-      // Find the current account plan.
-      const [accountAssignment] = await tx
-        .select()
-        .from(accountPlanAssignments)
-        .where(
-          and(
-            eq(accountPlanAssignments.accountId, account.id),
-            lte(accountPlanAssignments.effectiveFrom, now),
-          ),
-        )
-        .orderBy(desc(accountPlanAssignments.effectiveFrom))
-        .limit(1);
+        if (!accountAssignment) {
+          return {
+            status: 409,
+            body: { error: "No account plan is currently assigned" },
+          };
+        }
 
-      if (!accountAssignment) {
-        return {
-          status: 409,
-          body: { error: "No account plan is currently assigned" },
-        };
-      }
+        const accountPlan = await getPlanById(
+          tx,
+          accountAssignment.planId,
+        );
 
-      const [accountPlan] = await tx
-        .select()
-        .from(plans)
-        .where(eq(plans.id, accountAssignment.planId))
-        .limit(1);
+        if (!accountPlan || accountPlan.type !== "account") {
+          return {
+            status: 409,
+            body: { error: "The assigned account plan is invalid" },
+          };
+        }
 
-      if (!accountPlan || accountPlan.type !== "account") {
-        return {
-          status: 409,
-          body: { error: "The assigned account plan is invalid" },
-        };
-      }
+        // Find the current user plan.
+        const userAssignment = await getCurrentUserPlanAssignment(
+          tx,
+          user.id,
+          now,
+        );
 
-      // Find the current user plan.
-      const [userAssignment] = await tx
-        .select()
-        .from(userPlanAssignments)
-        .where(
-          and(
-            eq(userPlanAssignments.userId, user.id),
-            lte(userPlanAssignments.effectiveFrom, now),
-          ),
-        )
-        .orderBy(desc(userPlanAssignments.effectiveFrom))
-        .limit(1);
+        if (!userAssignment) {
+          return {
+            status: 409,
+            body: { error: "No user plan is currently assigned" },
+          };
+        }
 
-      if (!userAssignment) {
-        return {
-          status: 409,
-          body: { error: "No user plan is currently assigned" },
-        };
-      }
+        const userPlan = await getPlanById(tx,userAssignment.planId);
 
-      const [userPlan] = await tx
-        .select()
-        .from(plans)
-        .where(eq(plans.id, userAssignment.planId))
-        .limit(1);
+        if (!userPlan || userPlan.type !== "user") {
+          return {
+            status: 409,
+            body: { error: "The assigned user plan is invalid" },
+          };
+        }
 
-      if (!userPlan || userPlan.type !== "user") {
-        return {
-          status: 409,
-          body: { error: "The assigned user plan is invalid" },
-        };
-      }
+        // Read usage for the current UTC month.
+        const accountUsage = await getAccountMonthlyUsage(
+          tx,
+          account.id,
+          billingMonth,
+        );
 
-      // Read usage for the current UTC month.
-      const [accountUsage] = await tx
-        .select()
-        .from(accountMonthlyUsage)
-        .where(
-          and(
-            eq(accountMonthlyUsage.accountId, account.id),
-            eq(accountMonthlyUsage.billingMonth, billingMonth),
-          ),
-        )
-        .limit(1);
+        const userUsage = await getUserMonthlyUsage(
+          tx,
+          user.id,
+          billingMonth,
+        );
 
-      const [userUsage] = await tx
-        .select()
-        .from(userMonthlyUsage)
-        .where(
-          and(
-            eq(userMonthlyUsage.userId, user.id),
-            eq(userMonthlyUsage.billingMonth, billingMonth),
-          ),
-        )
-        .limit(1);
+        const accountConsumed = Number(
+          accountUsage?.consumedUnits ?? 0,
+        );
 
-      const accountConsumed = Number(accountUsage?.consumedUnits ?? 0);
-      const userConsumed = Number(userUsage?.consumedUnits ?? 0);
+        const userConsumed = Number(
+          userUsage?.consumedUnits ?? 0,
+        );
 
-      // Determine whether the request must be rejected.
-      let rejectionReason: string | null = null;
-      let rejectionScope: string | null = null;
+        // Determine whether the request must be rejected.
+        let rejectionReason: string | null = null;
+        let rejectionScope: string | null = null;
 
-      if (units > accountPlan.maxUnitsPerRequest) {
-        rejectionReason = "Account max units per request exceeded";
-        rejectionScope = "account";
-      } else if (units > userPlan.maxUnitsPerRequest) {
-        rejectionReason = "User max units per request exceeded";
-        rejectionScope = "user";
-      } else if (
-        accountConsumed + units > accountPlan.monthlyAllowance
-      ) {
-        rejectionReason = "Account monthly allowance exceeded";
-        rejectionScope = "account";
-      } else if (
-        userConsumed + units > userPlan.monthlyAllowance
-      ) {
-        rejectionReason = "User monthly allowance exceeded";
-        rejectionScope = "user";
-      }
+        if (units > accountPlan.maxUnitsPerRequest) {
+          rejectionReason = "Account max units per request exceeded";
+          rejectionScope = "account";
+        } else if (units > userPlan.maxUnitsPerRequest) {
+          rejectionReason = "User max units per request exceeded";
+          rejectionScope = "user";
+        } else if (
+          accountConsumed + units > accountPlan.monthlyAllowance
+        ) {
+          rejectionReason = "Account monthly allowance exceeded";
+          rejectionScope = "account";
+        } else if (
+          userConsumed + units > userPlan.monthlyAllowance
+        ) {
+          rejectionReason = "User monthly allowance exceeded";
+          rejectionScope = "user";
+        }
 
-      // Record rejected requests without updating usage.
-      if (rejectionReason !== null) {
-        const [savedRequest] = await tx
-          .insert(usageRequests)
-          .values({
-            accountId: account.id,
-            userId: user.id,
-            requestId: requestId.trim(),
+        // Record rejected requests without updating usage.
+        if (rejectionReason !== null) {
+          const savedRequest = await createUsageRequest(
+            tx,
+            account.id,
+            user.id,
+            requestId.trim(),
             units,
-            status: "REJECTED",
+            "REJECTED",
             rejectionReason,
             rejectionScope,
-          })
-          .returning();
+          );
+
+          if (!savedRequest) {
+            throw new Error("Failed to save rejected usage request");
+          }
+
+          return {
+            status: 429,
+            body: {
+              requestId: savedRequest.requestId,
+              status: savedRequest.status,
+              units,
+              rejectionReason: savedRequest.rejectionReason,
+              rejectionScope: savedRequest.rejectionScope,
+              billingMonth,
+              accountConsumed,
+              userConsumed,
+            },
+          };
+        }
+
+        // Increase account usage atomically.
+        await incrementAccountMonthlyUsage(
+          tx,
+          account.id,
+          billingMonth,
+          units,
+          now,
+        );
+
+        // Increase user usage atomically.
+        await incrementUserMonthlyUsage(
+          tx,
+          user.id,
+          billingMonth,
+          units,
+          now,
+        );
+
+        // Record the accepted request.
+        const savedRequest = await createUsageRequest(
+          tx,
+          account.id,
+          user.id,
+          requestId.trim(),
+          units,
+          "ACCEPTED",
+          null,
+          null,
+        );
 
         if (!savedRequest) {
-          throw new Error("Failed to save rejected usage request");
+          throw new Error("Failed to save accepted usage request");
         }
 
         return {
-          status: 429,
+          status: 200,
           body: {
             requestId: savedRequest.requestId,
             status: savedRequest.status,
             units,
-            rejectionReason: savedRequest.rejectionReason,
-            rejectionScope: savedRequest.rejectionScope,
             billingMonth,
-            accountConsumed,
-            userConsumed,
+            accountConsumed: accountConsumed + units,
+            userConsumed: userConsumed + units,
+            accountRemaining:
+              accountPlan.monthlyAllowance -
+              accountConsumed -
+              units,
+            userRemaining:
+              userPlan.monthlyAllowance -
+              userConsumed -
+              units,
+            idempotent: false,
           },
         };
-      }
+      });
 
-      // Increase account usage atomically.
-      await tx
-        .insert(accountMonthlyUsage)
-        .values({
-          accountId: account.id,
-          billingMonth,
-          consumedUnits: units,
-          updatedAt: now,
-        })
-        .onConflictDoUpdate({
-          target: [
-            accountMonthlyUsage.accountId,
-            accountMonthlyUsage.billingMonth,
-          ],
-          set: {
-            consumedUnits: sql`${accountMonthlyUsage.consumedUnits} + ${units}`,
-            updatedAt: now,
-          },
-        });
-
-      // Increase user usage atomically.
-      await tx
-        .insert(userMonthlyUsage)
-        .values({
-          userId: user.id,
-          billingMonth,
-          consumedUnits: units,
-          updatedAt: now,
-        })
-        .onConflictDoUpdate({
-          target: [
-            userMonthlyUsage.userId,
-            userMonthlyUsage.billingMonth,
-          ],
-          set: {
-            consumedUnits: sql`${userMonthlyUsage.consumedUnits} + ${units}`,
-            updatedAt: now,
-          },
-        });
-
-      // Record the accepted request.
-      const [savedRequest] = await tx
-        .insert(usageRequests)
-        .values({
-          accountId: account.id,
-          userId: user.id,
-          requestId: requestId.trim(),
-          units,
-          status: "ACCEPTED",
-          rejectionReason: null,
-          rejectionScope: null,
-        })
-        .returning();
-
-      if (!savedRequest) {
-        throw new Error("Failed to save accepted usage request");
-      }
-
-      return {
-        status: 200,
-        body: {
-          requestId: savedRequest.requestId,
-          status: savedRequest.status,
-          units,
-          billingMonth,
-          accountConsumed: accountConsumed + units,
-          userConsumed: userConsumed + units,
-          accountRemaining:
-            accountPlan.monthlyAllowance - accountConsumed - units,
-          userRemaining:
-            userPlan.monthlyAllowance - userConsumed - units,
-          idempotent: false,
-        },
-      };
-    });
-
-    res.status(result.status).json(result.body);
-  } catch (error) {
-    next(error);
-  }
-});
+      res.status(result.status).json(result.body);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
 
 async function main() {
   try {
@@ -765,10 +692,15 @@ async function main() {
     console.log("Migrations completed successfully!");
 
     app.listen(PORT, () => {
-      console.log(`Server is running on port ${PORT}`);
+      console.log(
+        `Server is running on port ${PORT}`,
+      );
     });
   } catch (error) {
-    console.error("Application startup failed:", error);
+    console.error(
+      "Application startup failed:",
+      error,
+    );
   }
 }
 
