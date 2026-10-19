@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, desc } from "drizzle-orm";
 import { db } from "../index.js";
 import { usageRequests } from "../schema.js";
 
@@ -48,3 +48,20 @@ export async function createUsageRequest(
 
   return request;
 }
+
+
+export async function getUsageRequestHistory(
+  database: Pick<typeof db, "select">,
+  accountId: string,
+  limit: number,
+  offset: number,
+) {
+  return database
+    .select()
+    .from(usageRequests)
+    .where(eq(usageRequests.accountId, accountId))
+    .orderBy(desc(usageRequests.createdAt))
+    .limit(limit)
+    .offset(offset);
+}
+

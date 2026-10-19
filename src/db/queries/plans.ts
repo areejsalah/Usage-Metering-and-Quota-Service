@@ -1,4 +1,4 @@
-import { eq, or } from "drizzle-orm";
+import { and, eq, or } from "drizzle-orm";
 import { db } from "../index.js";
 import { plans } from "../schema.js";
 
@@ -19,6 +19,33 @@ export async function createPlan(
       isPredefined: false,
       accountId,
     })
+    .returning();
+
+  return plan;
+}
+
+export async function updatePlan(
+  planId: string,
+  accountId: string,
+  name: string,
+  monthlyAllowance: number,
+  maxUnitsPerRequest: number,
+) {
+  const [plan] = await db
+    .update(plans)
+    .set({
+      name,
+      monthlyAllowance,
+      maxUnitsPerRequest,
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(plans.id, planId),
+        eq(plans.accountId, accountId),
+        eq(plans.isPredefined, false),
+      ),
+    )
     .returning();
 
   return plan;
