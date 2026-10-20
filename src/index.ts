@@ -38,7 +38,7 @@ app.post("/users/:externalId/plan", authenticateApiKey, handlerAssignUserPlan);
 app.get("/account/plan", authenticateApiKey, handlerGetCurrentAccountPlan);
 app.get("/users/:externalId/plan", authenticateApiKey, handlerGetCurrentUserPlan);
 app.post("/usage/consume", authenticateApiKey, handlerConsumeUsage);
-app.get("/usage/account", authenticateApiKey, handlerGetAccountUsage);
+app.get("/account/usage", authenticateApiKey, handlerGetAccountUsage);
 app.get("/users/:externalId/usage", authenticateApiKey, handlerGetUserUsage,);
 app.get("/usage/history", authenticateApiKey,  handlerGetUsageHistory,);
 app.post("/users", authenticateApiKey, handlerCreateUser);
