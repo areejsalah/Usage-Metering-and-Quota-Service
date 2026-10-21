@@ -11,6 +11,7 @@ import { handlerConsumeUsage, handlerGetAccountUsage, handlerGetUserUsage,  hand
 import { handlerCreatePlan, handlerGetPlans, handlerAssignAccountPlan, 
   handlerAssignUserPlan, handlerGetCurrentAccountPlan, handlerGetCurrentUserPlan,
   handlerUpdatePlan} from "./handlers/plans.js"
+import { createPredefinedPlans } from "./db/predefined-plans.js";
 
 
 
@@ -47,6 +48,7 @@ app.post("/accounts", handlerCreateAccount);
 
 app.patch("/plans/:planId", authenticateApiKey, handlerUpdatePlan);
 
+
 async function main() {
   try {
     await migrate(db, {
@@ -55,16 +57,14 @@ async function main() {
 
     console.log("Migrations completed successfully!");
 
+    await createPredefinedPlans();
+
     app.listen(PORT, () => {
-      console.log(
-        `Server is running on port ${PORT}`,
-      );
+      console.log(`Server is running on port ${PORT}`);
     });
   } catch (error) {
-    console.error(
-      "Application startup failed:",
-      error,
-    );
+    console.error("Application startup failed:", error);
+    process.exitCode = 1;
   }
 }
 
