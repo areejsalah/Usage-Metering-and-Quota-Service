@@ -243,6 +243,13 @@ test("rejects reusing a request ID with different usage data", async () => {
 
   assert.equal(firstResponse.status, 200);
 
+  const usageAfterFirstResponse = await request(
+    `/users/${encodeURIComponent(testUser.externalId)}/usage`,
+    { apiKey: account1.apiKey },
+  );
+  assert.equal(usageAfterFirstResponse.status, 200);
+  const usageAfterFirst = await usageAfterFirstResponse.json();
+
   const conflictResponse = await request("/usage/consume", {
     apiKey: account1.apiKey,
     method: "POST",
@@ -254,6 +261,108 @@ test("rejects reusing a request ID with different usage data", async () => {
   });
 
   assert.equal(conflictResponse.status, 409);
+
+  const usageAfterConflictResponse = await request(
+    `/users/${encodeURIComponent(testUser.externalId)}/usage`,
+    { apiKey: account1.apiKey },
+  );
+  assert.equal(usageAfterConflictResponse.status, 200);
+  const usageAfterConflict = await usageAfterConflictResponse.json();
+
+  assert.equal(
+    usageAfterConflict.consumedUnits,
+    usageAfterFirst.consumedUnits,
+    "Conflicting retry must not change usage",
+  );
+});
+
+test("rejects reusing a request ID with a different user", async () => {
+  const suffix = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const secondExternalId = `idempotency-user-${suffix}`;
+  const requestId = `usage-user-conflict-${suffix}`;
+  const units = 5;
+
+  const createUserResponse = await request("/users", {
+    apiKey: account1.apiKey,
+    method: "POST",
+    body: { externalId: secondExternalId },
+  });
+
+  assert.equal(createUserResponse.status, 201);
+
+  const assignPlanResponse = await request(
+    `/users/${encodeURIComponent(secondExternalId)}/plan`,
+    {
+      apiKey: account1.apiKey,
+      method: "POST",
+      body: { planId: userPlan.id },
+    },
+  );
+
+  assert.equal(assignPlanResponse.status, 201);
+
+  const firstResponse = await request("/usage/consume", {
+    apiKey: account1.apiKey,
+    method: "POST",
+    body: {
+      externalId: testUser.externalId,
+      units,
+      requestId,
+    },
+  });
+
+  assert.equal(firstResponse.status, 200);
+
+  const firstUserUsageBeforeResponse = await request(
+    `/users/${encodeURIComponent(testUser.externalId)}/usage`,
+    { apiKey: account1.apiKey },
+  );
+  assert.equal(firstUserUsageBeforeResponse.status, 200);
+  const firstUserUsageBefore = await firstUserUsageBeforeResponse.json();
+
+  const secondUserUsageBeforeResponse = await request(
+    `/users/${encodeURIComponent(secondExternalId)}/usage`,
+    { apiKey: account1.apiKey },
+  );
+  assert.equal(secondUserUsageBeforeResponse.status, 200);
+  const secondUserUsageBefore = await secondUserUsageBeforeResponse.json();
+
+  const conflictResponse = await request("/usage/consume", {
+    apiKey: account1.apiKey,
+    method: "POST",
+    body: {
+      externalId: secondExternalId,
+      units,
+      requestId,
+    },
+  });
+
+  assert.equal(conflictResponse.status, 409);
+
+  const firstUserUsageAfterResponse = await request(
+    `/users/${encodeURIComponent(testUser.externalId)}/usage`,
+    { apiKey: account1.apiKey },
+  );
+  assert.equal(firstUserUsageAfterResponse.status, 200);
+  const firstUserUsageAfter = await firstUserUsageAfterResponse.json();
+
+  const secondUserUsageAfterResponse = await request(
+    `/users/${encodeURIComponent(secondExternalId)}/usage`,
+    { apiKey: account1.apiKey },
+  );
+  assert.equal(secondUserUsageAfterResponse.status, 200);
+  const secondUserUsageAfter = await secondUserUsageAfterResponse.json();
+
+  assert.equal(
+    firstUserUsageAfter.consumedUnits,
+    firstUserUsageBefore.consumedUnits,
+    "Conflicting retry must not change the first user's usage",
+  );
+  assert.equal(
+    secondUserUsageAfter.consumedUnits,
+    secondUserUsageBefore.consumedUnits,
+    "Conflicting retry must not change the second user's usage",
+  );
 });
 
 test("rejects zero and negative usage units", async (t) => {
@@ -768,6 +877,164 @@ assert.ok(
   assert.ok(!account2RequestIds.includes(requestId2));
 });
 
+
+test("enforces a user's monthly allowance for concurrent usage requests", async () => {
+  const suffix = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const externalId = `concurrent-limit-user-${suffix}`;
+  const requestPrefix = `concurrent-user-limit-${suffix}`;
+
+  const planResponse = await request("/plans", {
+    apiKey: account1.apiKey,
+    method: "POST",
+    body: {
+      name: `Concurrent User Allowance ${suffix}`,
+      type: "user",
+      monthlyAllowance: 20,
+      maxUnitsPerRequest: 10,
+    },
+  });
+
+  assert.equal(planResponse.status, 201);
+  const { plan } = await planResponse.json();
+
+  const createUserResponse = await request("/users", {
+    apiKey: account1.apiKey,
+    method: "POST",
+    body: { externalId },
+  });
+
+  assert.equal(createUserResponse.status, 201);
+
+  const assignPlanResponse = await request(
+    `/users/${encodeURIComponent(externalId)}/plan`,
+    {
+      apiKey: account1.apiKey,
+      method: "POST",
+      body: { planId: plan.id },
+    },
+  );
+
+  assert.equal(assignPlanResponse.status, 201);
+
+  const responses = await Promise.all(
+    Array.from({ length: 5 }, (_, index) =>
+      request("/usage/consume", {
+        apiKey: account1.apiKey,
+        method: "POST",
+        body: {
+          externalId,
+          units: 10,
+          requestId: `${requestPrefix}-${index}`,
+        },
+      }),
+    ),
+  );
+
+  const results = await Promise.all(
+    responses.map(async (response) => ({
+      status: response.status,
+      body: await response.json(),
+    })),
+  );
+
+  const acceptedResults = results.filter(
+    (result) => result.status === 200 && result.body.status === "ACCEPTED",
+  );
+  const rejectedResults = results.filter(
+    (result) => result.status === 429 && result.body.status === "REJECTED",
+  );
+
+  assert.equal(acceptedResults.length, 2);
+  assert.equal(rejectedResults.length, 3);
+  assert.ok(
+    rejectedResults.every(
+      (result) =>
+        result.body.rejectionScope === "user" &&
+        result.body.rejectionReason === "User monthly allowance exceeded",
+    ),
+  );
+
+  const usageResponse = await request(
+    `/users/${encodeURIComponent(externalId)}/usage`,
+    { apiKey: account1.apiKey },
+  );
+
+  assert.equal(usageResponse.status, 200);
+  const usage = await usageResponse.json();
+  assert.equal(usage.consumedUnits, 20);
+});
+
+test("uses updated custom user plan settings for subsequent usage requests", async () => {
+  const suffix = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const externalId = `updated-plan-user-${suffix}`;
+
+  const planResponse = await request("/plans", {
+    apiKey: account1.apiKey,
+    method: "POST",
+    body: {
+      name: `Updated User Plan ${suffix}`,
+      type: "user",
+      monthlyAllowance: 20,
+      maxUnitsPerRequest: 30,
+    },
+  });
+
+  assert.equal(planResponse.status, 201);
+  const { plan } = await planResponse.json();
+
+  const createUserResponse = await request("/users", {
+    apiKey: account1.apiKey,
+    method: "POST",
+    body: { externalId },
+  });
+
+  assert.equal(createUserResponse.status, 201);
+
+  const assignPlanResponse = await request(
+    `/users/${encodeURIComponent(externalId)}/plan`,
+    {
+      apiKey: account1.apiKey,
+      method: "POST",
+      body: { planId: plan.id },
+    },
+  );
+
+  assert.equal(assignPlanResponse.status, 201);
+
+  const updateResponse = await request(`/plans/${plan.id}`, {
+    apiKey: account1.apiKey,
+    method: "PATCH",
+    body: { monthlyAllowance: 30 },
+  });
+
+  assert.equal(updateResponse.status, 200);
+  const { plan: updatedPlan } = await updateResponse.json();
+  assert.equal(updatedPlan.monthlyAllowance, 30);
+  assert.equal(updatedPlan.maxUnitsPerRequest, 30);
+
+  const consumeResponse = await request("/usage/consume", {
+    apiKey: account1.apiKey,
+    method: "POST",
+    body: {
+      externalId,
+      units: 25,
+      requestId: `updated-plan-usage-${suffix}`,
+    },
+  });
+
+  assert.equal(consumeResponse.status, 200);
+  const consumeResult = await consumeResponse.json();
+  assert.equal(consumeResult.status, "ACCEPTED");
+
+  const usageResponse = await request(
+    `/users/${encodeURIComponent(externalId)}/usage`,
+    { apiKey: account1.apiKey },
+  );
+
+  assert.equal(usageResponse.status, 200);
+  const usage = await usageResponse.json();
+  assert.equal(usage.consumedUnits, 25);
+});
 
 test("handles concurrent usage requests without losing or double-counting usage", async () => {
   const requestCount = 10;
