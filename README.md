@@ -17,22 +17,100 @@ The repository also includes command-line demo clients that simulate a business 
 - Custom plan updates and plan switches take effect for later requests while the current month's already-consumed usage and prior request history remain recorded.
 - Demo clients for successful and rejected consumption, concurrent account usage, history, plan changes, idempotency, validation, and account isolation.
 
-## Account and user data model
+## Database Schema
 
-An account represents the integrating business and owns the API key hash. Its users are records for that business's end users; each user is identified by an `externalId` that the integrating business supplies. A user is unique within its account, but another account can use the same external ID. The external ID is not a separate authentication credential.
+```mermaid
+erDiagram
+    ACCOUNTS {
+        uuid id PK
+        varchar name
+        varchar api_key_hash UK
+        timestamp created_at
+        timestamp updated_at
+    }
 
-The PostgreSQL schema represents the model with these tables:
+    USERS {
+        uuid id PK
+        uuid account_id FK
+        varchar external_id
+        timestamp created_at
+        timestamp updated_at
+    }
 
-| Table | Stored data and relationships |
-| --- | --- |
-| `accounts` | Account name and unique API-key hash. |
-| `users` | User external ID and owning account; unique on `(account_id, external_id)`. Deleting an account cascades to its users. |
-| `plans` | Plan type, name, allowance and per-request limit. Predefined plans have no owning account; custom plans reference the account that created them. |
-| `account_plan_assignments`, `user_plan_assignments` | Append-only plan assignment rows with an `effective_from` timestamp and foreign keys to the account or user and plan. The assignment endpoints set this timestamp to the current time. |
-| `account_monthly_usage`, `user_monthly_usage` | Aggregated consumed units keyed by account or user and `billing_month`. Each aggregate table has a composite primary key on its owner and month. |
-| `usage_requests` | Per-request history, including account, user, request ID, units, accepted/rejected status, rejection reason/scope, and creation time. The database enforces uniqueness of `(account_id, request_id)`. |
+    PLANS {
+        uuid id PK
+        varchar name
+        varchar type
+        integer monthly_allowance
+        integer max_units_per_request
+        boolean is_predefined
+        uuid account_id FK
+        timestamp created_at
+        timestamp updated_at
+    }
 
+    ACCOUNT_MONTHLY_USAGE {
+        uuid account_id PK, FK
+        varchar billing_month PK
+        bigint consumed_units
+        timestamp updated_at
+    }
+
+    USER_MONTHLY_USAGE {
+        uuid user_id PK, FK
+        varchar billing_month PK
+        bigint consumed_units
+        timestamp updated_at
+    }
+
+    USAGE_REQUESTS {
+        uuid id PK
+        uuid account_id FK
+        uuid user_id FK
+        varchar request_id
+        bigint units
+        varchar status
+        varchar rejection_reason
+        varchar rejection_scope
+        timestamp created_at
+    }
+
+    USER_PLAN_ASSIGNMENTS {
+        uuid id PK
+        uuid user_id FK
+        uuid plan_id FK
+        timestamp effective_from
+        timestamp created_at
+    }
+
+    ACCOUNT_PLAN_ASSIGNMENTS {
+        uuid id PK
+        uuid account_id FK
+        uuid plan_id FK
+        timestamp effective_from
+        timestamp created_at
+    }
+
+    ACCOUNTS ||--o{ USERS : has
+    ACCOUNTS ||--o{ USAGE_REQUESTS : owns
+    USERS ||--o{ USAGE_REQUESTS : generates
+    ACCOUNTS ||--o{ ACCOUNT_MONTHLY_USAGE : accumulates
+    USERS ||--o{ USER_MONTHLY_USAGE : accumulates
+    ACCOUNTS ||--o{ PLANS : owns_custom_plans
+    USERS ||--o{ USER_PLAN_ASSIGNMENTS : assigned_to_users
+    PLANS ||--o{ USER_PLAN_ASSIGNMENTS : assigned_plans
+    ACCOUNTS ||--o{ ACCOUNT_PLAN_ASSIGNMENTS : assigned_to_accounts
+    PLANS ||--o{ ACCOUNT_PLAN_ASSIGNMENTS : assigned_plans
+```
 Consumption runs in a database transaction. The handler locks the account row with `SELECT ... FOR UPDATE` before checking the user, request ID, plan limits, and current usage. This serializes consumption requests for the same account, including requests from different users on that account. Accepted requests update both monthly aggregates using atomic insert-or-increment operations and add an accepted history row. Allowance rejections add a rejected history row but do not change either aggregate. This favors consistent account-wide quota enforcement; requests sharing one account wait on that account lock.
+
+## Product assumptions and design decisions
+
+- An account represents an integrating business. Its API key authorizes account-level API calls; the business supplies each user's `externalId`. The external ID identifies a user within that account and is not an authentication credential.
+- Both the account plan and the user's plan apply to each usage request. Units must be a positive safe integer, and allowances are measured by UTC calendar month.
+- A `requestId` is unique within an account. Retrying it with the same user and units replays the stored outcome; using it with different request data returns a conflict.
+- Consumption is transactional and serialized on the account row to enforce account-wide limits. Rejected quota requests are retained in request history but do not increase usage aggregates.
+- Plan assignments are effective-dated. Changing plans does not reset current-month consumption. Custom plan edits update the existing plan row; request history does not snapshot the plan or allowance used at request time.
 
 ## Technology
 
@@ -91,7 +169,7 @@ The API listens on port `3000` in `src/index.ts`; the `PORT` value in Compose is
 Set `DB_PASSWORD` in `.env`, then build and start PostgreSQL and the API:
 
 ```sh
-docker compose up --build 
+docker compose up --build
 ```
 
 The API is available at `http://localhost:3000`; PostgreSQL is published at `localhost:5433`. The API container waits until the database health check succeeds. Check API readiness with:
@@ -366,7 +444,7 @@ See [`client/README.md`](client/README.md) for all available scenarios, commands
 
 ## Tests and load testing
 
-### API tests against an isolated database
+### Automated API tests
 
 `npm test` runs `tests/api.test.mjs` with Node's built-in test runner. It sends HTTP requests to the service at `BASE_URL` (default `http://localhost:3000`), creates test accounts, users, and plans, and does not clean those records up. It does not create or reset a database itself.
 
@@ -395,7 +473,7 @@ The suite covers these behaviors, grouped by area:
 - **Plan updates:** subsequent usage requests use updated custom user plan settings.
 - **Concurrent requests:** concurrent usage respects a user's monthly allowance and accepted concurrent requests are counted once without lost or double-counted usage.
 
-To isolate test data in a separate Compose project, first ensure no other project is using host ports `3000` and `5433`. From the repository root, start a uniquely named test stack:
+To keep test data in a separate Compose project and PostgreSQL volume, first ensure no other project is using host ports `3000` and `5433`. From the repository root, start a uniquely named test stack:
 
 ```sh
 docker compose -p usage-metering-test up --build -d db api
@@ -422,54 +500,17 @@ docker compose -p usage-metering-test down -v
 
 Do not point the tests at a database containing data you need to preserve: the test suite leaves its generated records behind. The `-v` cleanup command deletes the named volume for this test project.
 
-## Automated API Tests
-
-Run the automated API test suite with:
-
-```bash
-npm test
-```
-
-The tests verify the API's behavior, validation rules, usage limits, and concurrency handling.
-
-### Test Results
-
-The latest recorded test run produced the following results:
-
-| Metric | Result |
-|---|---:|
-| Total tests | 19 |
-| Passed | 19 |
-| Failed | 0 |
-| Duration | 1.77 seconds |
-
-### Test Coverage
-
-The automated tests cover the following areas:
-
-- **API Key Authentication:** Rejects requests with missing or invalid API keys and allows authenticated access.
-- **Account Isolation:** Prevents accounts from accessing or modifying another account's custom plans and ensures usage history remains account-scoped.
-- **Usage Validation and Quotas:** Rejects zero or negative units, usage beyond monthly allowances, and requests exceeding per-request limits.
-- **Idempotency:** Prevents duplicate usage from being counted twice and rejects reuse of a request ID with different usage data.
-- **Usage History:** Verifies pagination and account isolation.
-- **Plan Updates:** Ensures updated custom user plan settings apply to subsequent usage requests.
-- **Concurrent Requests:** Verifies monthly quota enforcement and ensures concurrent requests do not cause lost or double-counted usage.
-
-All 19 tests passed, with no failures.
-
----
-
-## Load Testing
+### Node.js load test (10,000 requests)
 
 The load test evaluates how the service handles a large number of concurrent usage requests and verifies that recorded consumption matches the expected total.
 
-### Prerequisites
+#### Prerequisites
 
 - Docker Desktop is running.
 - The project dependencies are installed.
 - The PostgreSQL service is available through Docker Compose.
 
-### Running the Load Test
+#### Running the Node.js load test
 
 **1. Start the test API** in the first PowerShell terminal, from the project directory:
 
@@ -493,7 +534,7 @@ node tests/load-test.mjs
 
 The 10,000-request test may take a few minutes to complete. Wait for the final results to appear.
 
-### Load Test Results
+#### Node.js load-test results
 
 The following results were recorded during a successful run with 10,000 requests and a concurrency level of 25.
 
@@ -513,7 +554,7 @@ The following results were recorded during a successful run with 10,000 requests
 | Expected consumed units | 10,000 |
 | Actual consumed units | 10,000 |
 
-### Performance Metrics Explained
+#### Performance metrics explained
 
 - **Throughput:** The average number of requests processed per second during the test.
 - **Average latency:** The mean response time across requests.
@@ -521,11 +562,12 @@ The following results were recorded during a successful run with 10,000 requests
 - **p95 latency:** 95% of requests completed within 332.48 ms.
 - **p99 latency:** 99% of requests completed within 390.61 ms.
 
-### Outcome
+#### Outcome
 
 All 10,000 requests were accepted, with zero rejections and zero errors. The actual consumed usage matched the expected total of 10,000 units.
 
 These results represent a single test run and do not guarantee identical performance under every production workload.
+
 ## Known limitations
 
 - API keys are created with accounts and stored as hashes, but the API has no key rotation or revocation endpoint.
@@ -535,6 +577,19 @@ These results represent a single test run and do not guarantee identical perform
 - Assignment rows and usage history are retained, but request history does not capture the plan or allowance used for each request. Plan edits update the plan row in place, which also affects the allowance later read for historical summary queries.
 - The API tests and Node load script create records without cleaning them up. Use a disposable database when running them.
 - The API has no custom error-response middleware; unexpected errors and unmatched routes are handled by Express defaults rather than the JSON error shapes returned by explicit handler validation.
-- The Node load script has a fixed one-account, one-user, 10,000-request workload. k6 scripts and verified performance results are not part of the current repository.
+- The Node.js load script has a fixed one-account, one-user, 10,000-request workload. The separate k6 benchmark and its recorded results are documented below; both load tools create records and should be run against disposable data.
 
+## k6 performance benchmark
 
+The k6 benchmark is separate from the Node.js 10,000-request load test above. It runs three consecutive 30-second arrival-rate stages at target rates of 25, 100, and 500 requests per second.
+
+In the recorded run, the 25 RPS stage passed. The 100 and 500 RPS stages experienced dropped arrivals and k6-observed errors, including timeouts; neither stage passed. The run recorded 4,854 accepted units, which matched both the account and user usage aggregates. A separate 100,001-unit quota probe returned HTTP `429` and did not increase usage.
+
+These are findings from one benchmark run, not a performance guarantee for other environments or workloads. See the run report for per-stage throughput, latency percentiles, error rates, and counts.
+
+- [Benchmark results](benchmark-results.md)
+- [Raw k6 results](benchmark-results.json)
+- [Benchmark setup and reproduction instructions](benchmark/README.md)
+- [k6 load-test script](benchmark/load-test.js)
+
+See [benchmark/README.md](benchmark/README.md) for dependencies, setup instructions, and the exact commands to reproduce the benchmark.
