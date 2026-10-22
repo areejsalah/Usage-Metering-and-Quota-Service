@@ -29,9 +29,26 @@ services:
       DB_PASSWORD: ${DB_PASSWORD}
     ports:
       - "3000:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     depends_on:
       db:
         condition: service_healthy
+
+  client:
+    build: .
+    command: ["npm", "run", "demo", "--", "${DEMO_EXTERNAL_USER_ID:-customer-123}", "${DEMO_DOCUMENT_TEXT:-Sample document for the Compose demo}"]
+    environment:
+      USAGE_API_URL: http://api:3000
+      USAGE_API_KEY: ${USAGE_API_KEY:-}
+      DEMO_ACCOUNT_NAME: ${DEMO_ACCOUNT_NAME:-Compose demo account}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: "no"
 
 volumes:
   postgres_data:
