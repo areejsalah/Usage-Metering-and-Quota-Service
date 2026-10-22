@@ -1,5 +1,5 @@
 
-const BASE_URL = process.env.BASE_URL ?? "http://localhost:3001";
+const BASE_URL = process.env.BASE_URL ?? "http://localhost:3000";
 
 const CONCURRENCY = 25;
 const TOTAL_REQUESTS = 10000;

@@ -5,8 +5,17 @@
   "main": "index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "test": "node --test ./tests/api.test.mjs"
-
+    "test": "node --test ./tests/api.test.mjs",
+    "demo": "node client/usage-client.mjs",
+    "demo:success": "node client/scenario-success.mjs",
+    "demo:rejection": "node client/scenario-rejection.mjs",
+    "demo:shared-account": "node client/scenario-shared-account.mjs",
+    "demo:history": "node client/scenario-history.mjs",
+    "demo:plan-changes": "node client/scenario-plan-changes.mjs",
+    "demo:idempotency": "node client/scenario-idempotency.mjs",
+    "demo:concurrency": "node client/scenario-concurrency.mjs",
+    "demo:isolation": "node client/scenario-isolation.mjs",
+    "demo:validation": "node client/scenario-validation.mjs"
   },
   "keywords": [],
   "author": "",
