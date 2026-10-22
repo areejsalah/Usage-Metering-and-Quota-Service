@@ -3,3 +3,4 @@ node_modules/
 dist/
 .env
 migrate.log
+/benchmark/benchmark-target.json
