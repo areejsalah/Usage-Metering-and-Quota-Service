@@ -5,7 +5,7 @@ Run ID: `ffd5bdc4-47db-425e-a875-8baa539e4021`
 Target: `http://localhost:3100` (isolated benchmark Compose stack)
 Scenario: fresh account and user, one unit per request; no historical usage was seeded.
 
-| Stage | Target rate | Iterations started | Responses | Accepted in history | Rejected in history | Errors | Dropped iterations | Accepted throughput | Error rate | Avg latency | p50 | p95 | p99 | Result |
+| Stage | Target rate | Iterations started | HTTP samples | Accepted in history | Rejected in history | k6 errors | Dropped iterations | Accepted throughput | k6 error rate | Avg latency | p50 | p95 | p99 | Result |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | 25 RPS | 25/s | 751 | 751 | 751 | 0 | 0 | 0 | 25.03 req/s | 0.00% | 22.45 ms | 19.74 ms | 37.16 ms | 82.88 ms | Passed |
 | 100 RPS | 100/s | 2177 | 2177 | 2177 | 0 | 218 | 824 | 72.57 req/s | 10.01% | 9484.35 ms | 6741.82 ms | 30006.46 ms | 30119.46 ms | Failed / limited |
@@ -18,7 +18,7 @@ Scenario: fresh account and user, one unit per request; no historical usage was 
 - Usage total matches expected accepted usage: **yes**.
 - Over-limit probe (100,001 units; limit 100,000): HTTP 429, REJECTED; it did not increment usage: **yes**.
 
-Accepted throughput is persisted accepted requests from each 30-second stage divided by its arrival window. Accepted/rejected counts come from paginated usage history, so requests processed by the API after a client timeout are still reconciled. Error rate counts unexpected outcomes and transport errors among completed k6 HTTP samples; quota rejections are reported separately. Latency percentiles use the raw `http_req_duration` samples (nearest-rank percentile). Dropped iterations are arrivals k6 could not start.
+Accepted throughput is persisted accepted requests from each 30-second stage divided by its arrival window. Accepted/rejected counts come from paginated usage history, so requests processed by the API after a client timeout are still reconciled. k6 errors and error rate describe load-generator-observed unexpected responses and transport errors, including timeouts; a timed-out request can still appear as accepted in server history if the API finished it. Quota rejections are reported separately. Latency percentiles use the raw `http_req_duration` samples (nearest-rank percentile). Dropped iterations are arrivals k6 could not start.
 
 Raw k6 JSON output: [benchmark-results.json](benchmark-results.json). It contains per-sample metric points.
 
